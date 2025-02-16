@@ -2,156 +2,186 @@ package asg3
 
 import (
 	"log"
-	"math/rand"
+	"strconv"
+	"sync"
 )
 
-// Max random delay added to packet delivery
-const maxDelay = 5
+// The main participant of the distributed snapshot protocol.
+// nodes exchange token messages and marker messages among each other.
+// Token messages represent the transfer of Tokens from one node to another.
+// Marker messages represent the progress of the snapshot process. The bulk of
+// the distributed protocol is implemented in `HandlePacket` and `StartSnapshot`.
 
-type ChandyLamportSim struct {
-	time           int
-	nextSnapshotId int
-	nodes          map[string]*Node // key = node ID
-	logger         *Logger
-	// TODO: You can add more fields here
-	snaps          map[int]*GlobalSnapshot
-	completedSnaps map[int]int
-	results        map[int]*(chan *GlobalSnapshot)
+type Node struct {
+	sim           *ChandyLamportSim
+	id            string
+	tokens        int
+	outboundLinks map[string]*Link // key = link.dest
+	inboundLinks  map[string]*Link // key = link.src
+
+	// TODO: add more fields here (what does each node need to keep track of?)
+	mutex        sync.RWMutex
+	pState       map[int]int
+	recStatus    map[int]bool
+	inChanMarked map[string]bool
+	inChanData   map[string]string
 }
 
-func NewSimulator() *ChandyLamportSim {
-	return &ChandyLamportSim{
-		time:           0,
-		nextSnapshotId: 0,
-		nodes:          make(map[string]*Node),
-		logger:         NewLogger(),
-		// ToDo: you may need to modify this if you modify the above struct
-		snaps:          make(map[int]*GlobalSnapshot),
-		completedSnaps: make(map[int]int),
-		results:        make(map[int]*chan *GlobalSnapshot),
+// A unidirectional communication channel between two nodes
+// Each link contains an event queue (as opposed to a packet queue)
+type Link struct {
+	src      string
+	dest     string
+	msgQueue *Queue
+}
+
+func CreateNode(id string, tokens int, sim *ChandyLamportSim) *Node {
+	return &Node{
+		sim:           sim,
+		id:            id,
+		tokens:        tokens,
+		outboundLinks: make(map[string]*Link),
+		inboundLinks:  make(map[string]*Link),
+		// TODO: You may need to modify this if you make modifications above
+		mutex:        sync.RWMutex{},
+		pState:       make(map[int]int),
+		recStatus:    make(map[int]bool),
+		inChanMarked: make(map[string]bool),
+		inChanData:   make(map[string]string),
 	}
 }
 
-// Add a node to this simulator with the specified number of starting tokens
-func (sim *ChandyLamportSim) AddNode(id string, tokens int) {
-	node := CreateNode(id, tokens, sim)
-	sim.nodes[id] = node
+// Add a unidirectional link to the destination node
+func (node *Node) AddOutboundLink(dest *Node) {
+	if node == dest {
+		return
+	}
+	l := Link{node.id, dest.id, NewQueue()}
+	node.outboundLinks[dest.id] = &l
+	dest.inboundLinks[node.id] = &l
 }
 
-// Add a unidirectional link between two nodes
-func (sim *ChandyLamportSim) AddLink(src string, dest string) {
-	node1, ok1 := sim.nodes[src]
-	node2, ok2 := sim.nodes[dest]
-	if !ok1 {
-		log.Fatalf("Node %v does not exist\n", src)
-	}
-	if !ok2 {
-		log.Fatalf("Node %v does not exist\n", dest)
-	}
-	node1.AddOutboundLink(node2)
-}
-
-func (sim *ChandyLamportSim) ProcessEvent(event interface{}) {
-	switch event := event.(type) {
-	case PassTokenEvent:
-		src := sim.nodes[event.src]
-		src.SendTokens(event.tokens, event.dest)
-	case SnapshotEvent:
-		sim.StartSnapshot(event.nodeId)
-	default:
-		log.Fatal("Error unknown event: ", event)
+// Send a message on all of the node's outbound links
+func (node *Node) SendToNeighbors(message Message) {
+	for _, nodeId := range getSortedKeys(node.outboundLinks) {
+		link := node.outboundLinks[nodeId]
+		node.sim.logger.RecordEvent(
+			node,
+			SentMsgRecord{node.id, link.dest, message})
+		link.msgQueue.Push(SendMsgEvent{
+			node.id,
+			link.dest,
+			message,
+			node.sim.GetReceiveTime()})
 	}
 }
 
-// Advance the simulator time forward by one step and deliver at most one packet per node
-func (sim *ChandyLamportSim) Tick() {
-	sim.time++
-	sim.logger.NewEpoch()
-	// Note: to ensure deterministic ordering of packet delivery across the nodes,
-	// we must also iterate through the nodes and the links in a deterministic way
-	for _, nodeId := range getSortedKeys(sim.nodes) {
-		node := sim.nodes[nodeId]
-		for _, dest := range getSortedKeys(node.outboundLinks) {
-			link := node.outboundLinks[dest]
-			// Deliver at most one packet per node at each time step to
-			// establish total ordering of packet delivery to each node
-			if !link.msgQueue.Empty() {
-				e := link.msgQueue.Peek().(SendMsgEvent)
-				if e.receiveTime <= sim.time {
-					link.msgQueue.Pop()
-					sim.logger.RecordEvent(
-						sim.nodes[e.dest],
-						ReceivedMsgRecord{e.src, e.dest, e.message})
-					sim.nodes[e.dest].HandlePacket(e.src, e.message)
-					break
+// Send a number of Tokens to a neighbor attached to this node
+func (node *Node) SendTokens(numTokens int, dest string) {
+	if node.tokens < numTokens {
+		log.Fatalf("node %v attempted to send %v Tokens when it only has %v\n",
+			node.id, numTokens, node.tokens)
+	}
+	message := Message{isMarker: false, data: numTokens}
+	node.sim.logger.RecordEvent(node, SentMsgRecord{node.id, dest, message})
+	// Update local state before sending the Tokens
+	node.tokens -= numTokens
+	link, ok := node.outboundLinks[dest]
+	if !ok {
+		log.Fatalf("Unknown dest ID %v from node %v\n", dest, node.id)
+	}
+
+	link.msgQueue.Push(SendMsgEvent{
+		node.id,
+		dest,
+		message,
+		node.sim.GetReceiveTime()})
+}
+
+func (node *Node) HandlePacket(src string, message Message) {
+	// TODO: Write this method
+	node.sim.logger.RecordEvent(
+		node,
+		ReceivedMsgRecord{src, node.id, message})
+	if message.isMarker {
+		node.handleMarker(src, message)
+	} else {
+		node.handleToken(src, message)
+	}
+
+}
+
+func (node *Node) handleMarker(src string, message Message) {
+	snapshotID := message.data
+	directions := node.inboundLinks[src].src + "->" + node.inboundLinks[src].dest
+	data := strconv.Itoa(snapshotID) + "|" + directions
+
+	node.mutex.Lock()
+	node.inChanMarked[data] = true
+	node.mutex.Unlock()
+
+	node.mutex.RLock()
+	_, exists := node.recStatus[snapshotID]
+	node.mutex.RUnlock()
+
+	if !exists {
+		node.recStatus[snapshotID] = true
+		node.StartSnapshot(snapshotID)
+		node.mutex.Lock()
+		node.inChanData[data] = ""
+		node.mutex.Unlock()
+	}
+	count := 0
+	for srcNode := range node.inboundLinks {
+		dir := srcNode + "->" + node.id
+		fMarker := strconv.Itoa(snapshotID) + "|" + dir
+		node.mutex.RLock()
+		_, visited := node.inChanMarked[fMarker]
+		node.mutex.RUnlock()
+		if visited {
+			count++
+		}
+	}
+	if count == len(node.inboundLinks) {
+		node.recStatus[snapshotID] = false
+		node.sim.NotifyCompletedSnapshot(node.id, snapshotID)
+	}
+}
+
+func (node *Node) handleToken(src string, message Message) {
+
+	node.tokens += message.data
+	if len(node.recStatus) > 0 {
+		for id, status := range node.recStatus {
+			directions := node.inboundLinks[src].src + "->" + node.inboundLinks[src].dest
+			data := strconv.Itoa(id) + "|" + directions
+			node.mutex.RLock()
+			_, visited := node.inChanMarked[data]
+			node.mutex.RUnlock()
+			if status && !visited {
+				node.mutex.RLock()
+				st, status := node.inChanData[data]
+				node.mutex.RUnlock()
+				if status {
+					m := st + "|" + strconv.Itoa(message.data)
+					node.mutex.Lock()
+					node.inChanData[data] = m
+					node.mutex.Unlock()
+				} else {
+					node.mutex.Lock()
+					node.inChanData[data] = strconv.Itoa(message.data)
+					node.mutex.Unlock()
 				}
+
 			}
 		}
 	}
 }
+func (node *Node) StartSnapshot(snapshotId int) {
 
-// Return the receive time of a message after adding a random delay.
-// Note: At each time step, only one message is delivered to a destination.
-// This implies that the message may be received *after* the time step returned in this function.
-// See the clarification in the document of the assignment
-func (sim *ChandyLamportSim) GetReceiveTime() int {
-	return sim.time + 1 + rand.Intn(maxDelay)
-}
-
-func (sim *ChandyLamportSim) StartSnapshot(nodeId string) {
-	snapshotId := sim.nextSnapshotId
-	sim.nextSnapshotId++
-	sim.logger.RecordEvent(sim.nodes[nodeId], StartSnapshotRecord{nodeId, snapshotId})
-	// TODO: Complete this method
-	snap := GlobalSnapshot{snapshotId, make(map[string]int), make([]*MsgSnapshot, 0)}
-	sim.snaps[snapshotId] = &snap
-	sim.nodes[nodeId].StartSnapshot(snapshotId)
-	f := make(chan *GlobalSnapshot)
-	sim.results[snapshotId] = &f
-	// node := sim.nodes[nodeId]
-	// node.lock.Lock()
-	// defer node.lock.Unlock()
-	// node.recording = true
-	// for destID := range node.outboundLinks {
-	// 	node.SendTokens(0, destID)
-	// }
-
-}
-
-func (sim *ChandyLamportSim) NotifyCompletedSnapshot(nodeId string, snapshotId int) {
-	sim.logger.RecordEvent(sim.nodes[nodeId], EndSnapshotRecord{nodeId, snapshotId})
-
-	// TODO: Complete this method
-	// sim.CollectSnapshot(snapshotId)
-	result := sim.nodes[nodeId].active[snapshotId]
-	sim.snaps[snapshotId].tokenMap[nodeId] = result.nodeToken
-	for i, _ := range result.messages {
-		sim.snaps[snapshotId].messages = append(sim.snaps[snapshotId].messages, &result.messages[i])
-	}
-	sim.completedSnaps[snapshotId]++
-	if sim.completedSnaps[snapshotId] == len(sim.nodes) {
-		go func(sim *ChandyLamportSim, snapshotId int) {
-			t := sim.results[snapshotId]
-			*(t) <- sim.snaps[snapshotId]
-		}(sim, snapshotId)
-	}
-
-}
-
-func (sim *ChandyLamportSim) CollectSnapshot(snapshotId int) *GlobalSnapshot {
-
-	// TODO: Complete this method
-	snap := GlobalSnapshot{snapshotId, make(map[string]int), make([]*MsgSnapshot, 0)}
-	for _, node := range sim.nodes {
-		// Check if the node has recorded snapshot information for the given snapshot ID
-		if result, ok := node.buffered[snapshotId]; ok {
-			// Aggregate token information
-			snap.tokenMap[node.id] = result
-			// Aggregate message snapshots
-			for i := range result.messages {
-				snap.messages = append(snap.messages, &result.messages[i])
-			}
-		}
-	}
-	return &snap
+	node.recStatus[snapshotId] = true
+	node.mutex.Lock()
+	node.pState[snapshotId] = node.tokens
+	node.mutex.Unlock()
+	node.SendToNeighbors(Message{true, snapshotId})
 }
