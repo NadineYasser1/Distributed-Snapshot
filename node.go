@@ -1,14 +1,14 @@
 package asg3
 
 import (
-	"fmt"
 	"log"
+	"strconv"
 	"sync"
 )
 
 // The main participant of the distributed snapshot protocol.
 // nodes exchange token messages and marker messages among each other.
-// Token messages represent the transfer of tokens from one node to another.
+// Token messages represent the transfer of Tokens from one node to another.
 // Marker messages represent the progress of the snapshot process. The bulk of
 // the distributed protocol is implemented in `HandlePacket` and `StartSnapshot`.
 
@@ -20,33 +20,11 @@ type Node struct {
 	inboundLinks  map[string]*Link // key = link.src
 
 	// TODO: add more fields here (what does each node need to keep track of?)
-	bros     int
-	marks    map[string]int
-	lastMark int
-	active   map[int]*ActiveSnapshot
-	buffered map[int]bool
-	lock     sync.Mutex
-}
-
-type ActiveSnapshot struct {
-	node         *Node
-	currentBro   int
-	finishedBros int
-	nodeToken    int
-	messages     []MsgSnapshot
-}
-
-func (active *ActiveSnapshot) addMarker() bool {
-	active.finishedBros++
-	if active.finishedBros == active.currentBro {
-		return true
-	} else {
-		return false
-	}
-}
-
-func (active *ActiveSnapshot) addTokenMsg(src string, msg Message) {
-	active.messages = append(active.messages, MsgSnapshot{src, active.node.id, msg})
+	mutex        sync.RWMutex
+	pState       map[int]int
+	recStatus    map[int]bool
+	inChanMarked map[string]bool
+	inChanData   map[string]string
 }
 
 // A unidirectional communication channel between two nodes
@@ -65,47 +43,11 @@ func CreateNode(id string, tokens int, sim *ChandyLamportSim) *Node {
 		outboundLinks: make(map[string]*Link),
 		inboundLinks:  make(map[string]*Link),
 		// TODO: You may need to modify this if you make modifications above
-		bros:     0,
-		marks:    make(map[string]int),
-		lastMark: -1,
-		active:   make(map[int]*ActiveSnapshot),
-		buffered: make(map[int]bool),
-	}
-}
-func (node *Node) CreateActiveSnapshot(id int, fromBro bool) bool {
-	node.active[id] = &ActiveSnapshot{node, node.bros, 0, node.tokens, make([]MsgSnapshot, 0)}
-	if !fromBro {
-		return false
-	} else {
-		return true
-	}
-}
-
-func (node *Node) StartSnapshotRecord(src string, msg Message) {
-	nextActive, f := node.marks[src]
-	if !f {
-		nextActive = 0
-	} else {
-		nextActive++
-	}
-	for {
-		if nextActive > node.lastMark {
-			break
-		}
-		_, ok := node.active[nextActive]
-		if !ok {
-			continue
-		}
-		(*((*node).active[nextActive])).addTokenMsg(src, msg)
-		nextActive++
-	}
-
-}
-
-func free(node *Node, snapshotId int) {
-	_, ok := (*node).buffered[snapshotId+1]
-	if ok {
-		(*node).StartSnapshot(snapshotId + 1)
+		mutex:        sync.RWMutex{},
+		pState:       make(map[int]int),
+		recStatus:    make(map[int]bool),
+		inChanMarked: make(map[string]bool),
+		inChanData:   make(map[string]string),
 	}
 }
 
@@ -134,15 +76,15 @@ func (node *Node) SendToNeighbors(message Message) {
 	}
 }
 
-// Send a number of tokens to a neighbor attached to this node
+// Send a number of Tokens to a neighbor attached to this node
 func (node *Node) SendTokens(numTokens int, dest string) {
 	if node.tokens < numTokens {
-		log.Fatalf("node %v attempted to send %v tokens when it only has %v\n",
+		log.Fatalf("node %v attempted to send %v Tokens when it only has %v\n",
 			node.id, numTokens, node.tokens)
 	}
 	message := Message{isMarker: false, data: numTokens}
 	node.sim.logger.RecordEvent(node, SentMsgRecord{node.id, dest, message})
-	// Update local state before sending the tokens
+	// Update local state before sending the Tokens
 	node.tokens -= numTokens
 	link, ok := node.outboundLinks[dest]
 	if !ok {
@@ -158,70 +100,88 @@ func (node *Node) SendTokens(numTokens int, dest string) {
 
 func (node *Node) HandlePacket(src string, message Message) {
 	// TODO: Write this method
-
-	node.lock.Lock()
-	defer node.lock.Unlock()
+	node.sim.logger.RecordEvent(
+		node,
+		ReceivedMsgRecord{src, node.id, message})
 	if message.isMarker {
-		node.marks[src] = message.data
-		_, ok := node.active[message.data]
-		if !ok {
-			(*node).StartSnapshot(message.data)
-		} else {
-			if (*node.active[message.data]).addMarker() {
-				node.sim.NotifyCompletedSnapshot(node.id, message.data)
-			}
-		}
+		node.handleMarker(src, message)
 	} else {
-		node.tokens += message.data
-		(*node).StartSnapshotRecord(src, message)
+		node.handleToken(src, message)
 	}
-	// 	node.recording = true
-	// 	node.sim.logger.RecordEvent(node, ReceivedMsgRecord{src, node.id, message})
-	// 	snapshotId := message.data
-	// 	node.HandlePacket(src, message)
-	// 	node.lock.Unlock()
-	// 	node.sim.NotifyCompletedSnapshot(node.id, snapshotId)
-	// } else {
-	// 	// if node.recording {
-	// 	// 	node.lock.Lock()
-	// 	// 	node.messageSnapshots = append(node.messageSnapshots, &MsgSnapshot{
-	// 	// 		src:     src,
-	// 	// 		dest:    node.id,
-	// 	// 		message: message,
-	// 	// 	})
-	// 	// 	node.sim.logger.RecordEvent(node, ReceivedMsgRecord{src, node.id, message})
-	// 	// 	node.HandlePacket(src, message)
-	// 	// 	node.lock.Unlock()
-	// 	// 	node.sim.NotifyCompletedSnapshot(node.id, node.sim.nextSnapshotId-1)
-	// 	// } else {
-	// 	node.tokens += message.data
-	// }
-	// // }
+
 }
 
+func (node *Node) handleMarker(src string, message Message) {
+	snapshotID := message.data
+	directions := node.inboundLinks[src].src + "->" + node.inboundLinks[src].dest
+	data := strconv.Itoa(snapshotID) + "|" + directions
+
+	node.mutex.Lock()
+	node.inChanMarked[data] = true
+	node.mutex.Unlock()
+
+	node.mutex.RLock()
+	_, exists := node.recStatus[snapshotID]
+	node.mutex.RUnlock()
+
+	if !exists {
+		node.recStatus[snapshotID] = true
+		node.StartSnapshot(snapshotID)
+		node.mutex.Lock()
+		node.inChanData[data] = ""
+		node.mutex.Unlock()
+	}
+	count := 0
+	for srcNode := range node.inboundLinks {
+		dir := srcNode + "->" + node.id
+		fMarker := strconv.Itoa(snapshotID) + "|" + dir
+		node.mutex.RLock()
+		_, visited := node.inChanMarked[fMarker]
+		node.mutex.RUnlock()
+		if visited {
+			count++
+		}
+	}
+	if count == len(node.inboundLinks) {
+		node.recStatus[snapshotID] = false
+		node.sim.NotifyCompletedSnapshot(node.id, snapshotID)
+	}
+}
+
+func (node *Node) handleToken(src string, message Message) {
+
+	node.tokens += message.data
+	if len(node.recStatus) > 0 {
+		for id, status := range node.recStatus {
+			directions := node.inboundLinks[src].src + "->" + node.inboundLinks[src].dest
+			data := strconv.Itoa(id) + "|" + directions
+			node.mutex.RLock()
+			_, visited := node.inChanMarked[data]
+			node.mutex.RUnlock()
+			if status && !visited {
+				node.mutex.RLock()
+				st, status := node.inChanData[data]
+				node.mutex.RUnlock()
+				if status {
+					m := st + "|" + strconv.Itoa(message.data)
+					node.mutex.Lock()
+					node.inChanData[data] = m
+					node.mutex.Unlock()
+				} else {
+					node.mutex.Lock()
+					node.inChanData[data] = strconv.Itoa(message.data)
+					node.mutex.Unlock()
+				}
+
+			}
+		}
+	}
+}
 func (node *Node) StartSnapshot(snapshotId int) {
 
-	// ToDo: Write this method
-	node.lock.Lock()
-	defer node.lock.Unlock()
-	if snapshotId > node.lastMark+1 {
-		node.buffered[snapshotId] = true
-		return
-	}
-	if snapshotId != node.lastMark+1 {
-		fmt.Println()
-	}
-	node.lastMark = snapshotId
-	if (*node).CreateActiveSnapshot(snapshotId, true) {
-		(*node.sim).NotifyCompletedSnapshot(node.id, snapshotId)
-	}
-	(*node).SendToNeighbors(Message{true, snapshotId})
-	free(node, snapshotId)
-	// for dest := range node.outboundLinks {
-	// 	node.SendTokens(node.tokens, dest)
-	// }
-	// node.sim.logger.RecordEvent(node, StartSnapshotRecord{node.id, snapshotId})
-	// node.recording = true
-	// node.localSnapshots = make(map[string]int)
-	// node.messageSnapshots = nil
+	node.recStatus[snapshotId] = true
+	node.mutex.Lock()
+	node.pState[snapshotId] = node.tokens
+	node.mutex.Unlock()
+	node.SendToNeighbors(Message{true, snapshotId})
 }
